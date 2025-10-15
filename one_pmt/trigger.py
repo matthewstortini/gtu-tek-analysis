@@ -93,7 +93,6 @@ def get_calibration_constants(scope, channels):
     return calib
 
 def create_run_file(path: str,
-                    channels: list[str],
                     wfm_sample_size: int,
                     chunk_size: int = 50,
                     t_dtype: str = "f8",
@@ -127,20 +126,18 @@ def create_run_file(path: str,
                     Voltage samples for PMT (first scope channel)
                 feb_v : v_dtype [N, wfm_sample_size]
                     Voltage samples for FEB (second scope channel)
-                channels : string [2]
-                    stores the scope channel labels in order (e.g. ["ch1","ch3"])
 
         /t_axis (group)
             Datasets:
-                <chan>_t : t_dtype [wfm_sample_size]
-                    Time axis for <chan> -- written once, shared by all events
+                pmt_t : t_dtype [wfm_sample_size]
+                    Time axis for PMT -- written once, shared by all events
+                feb_t : t_dtype [wfm_sample_size]
+                    Time axis for FEB -- written once, shared by all events
 
     Parameters:
 
        path : str
            Output file path (e.g. "run.h5")
-       channels : list[str]
-           Scope channels we want to save waveforms for
        wfm_sample_size : int
            Number of samples in each individual waveform
        chunk_size : int
@@ -165,10 +162,6 @@ def create_run_file(path: str,
         runinfo.attrs["nevents"]  = 0                # placeholder
         runinfo.attrs["feb_lane"] = int(feb_lane)
         runinfo.attrs["pmt_id"] = int(pmt_id)
-
-        # store the scope channel list
-        str_dt = h5py.string_dtype(encoding="utf-8")
-        events.create_dataset("channels", data=np.asarray(channels, dtype=str_dt))
 
         # per-event timestamp
         events.create_dataset(
@@ -201,14 +194,19 @@ def create_run_file(path: str,
             compression=compression
         )
 
-        # time axis for each scope channel (can differ per channel)
-        for ch in channels:
-            t_axis.create_dataset(
-                f"{ch}_t",
-                shape=(wfm_sample_size,),
-                dtype=t_dtype,
-                compression=compression
-            )
+        # time axis for PMT and FEB (written once)
+        t_axis.create_dataset(
+            "pmt_t",
+            shape=(wfm_sample_size,),
+            dtype=t_dtype,
+            compression=compression
+        )
+        t_axis.create_dataset(
+            "feb_t",
+            shape=(wfm_sample_size,),
+            dtype=t_dtype,
+            compression=compression
+        )
 
 def write_waveforms(scope, h5_path, channels, calib_constants, first_waveform):
     """
@@ -269,7 +267,10 @@ def write_waveforms(scope, h5_path, channels, calib_constants, first_waveform):
                 t = XZERO + (np.arange(n_wfm_samples) - XOFF) * XINCR
 
                 # write t_axis to hdf5 file
-                t_axis[f"{ch}_t"][:] = t.astype(t_axis[f"{ch}_t"].dtype, copy=False)
+                if i == 0:
+                    t_axis["pmt_t"][:] = t.astype(t_axis["pmt_t"].dtype, copy=False)
+                else:
+                    t_axis["feb_t"][:] = t.astype(t_axis["feb_t"].dtype, copy=False)
                 
 def get_wfm_size(scope, channel):
     """
@@ -308,7 +309,7 @@ def write_end_run(h5_path, elapsed_time, n_triggers):
         runinfo.attrs["run_time"] = np.float64(elapsed_time)
         runinfo.attrs["nevents"]  = int(n_triggers)
 
-def make_live_plots(h5_path, channels, plot_scales, plot_labels):
+def make_live_plots(h5_path, plot_scales, plot_labels):
     """
     Function to make live plots as data is taken
 
@@ -322,8 +323,6 @@ def make_live_plots(h5_path, channels, plot_scales, plot_labels):
     Parameters:
         h5_path : str
             Path to HDF5 file being written/read.
-        channels : list[str]
-            Scope channels to plot (order must match datasets in file).
         plot_scales : list[float]
             Per-channel multiplicative scale to apply to voltages when plotting
             (one entry per scope channel).
@@ -332,9 +331,6 @@ def make_live_plots(h5_path, channels, plot_scales, plot_labels):
     """
     # colors
     color_cycle = ["black", "blue"]
-    ch_color = {}
-    for i, ch in enumerate(channels):
-        ch_color[ch] = color_cycle[i]
 
     # open file, grab most recent waveform and last 25 (if we have 25 yet)
     with h5py.File(h5_path, "r") as f:
@@ -352,18 +348,14 @@ def make_live_plots(h5_path, channels, plot_scales, plot_labels):
         plt.clf()
 
         last_idx = n_events - 1
-        for i, ch in enumerate(channels):
-            # time stored in seconds -> convert to ns for plotting
-            t = np.asarray(t_axis[f"{ch}_t"][:], dtype=np.float64) * 1e9
-            # voltages from fixed datasets
-            ds_name = "pmt_v" if i == 0 else "feb_v"
-            v = np.asarray(events[ds_name][last_idx, :], dtype=np.float64)
 
-            # apply per-channel scale and label
-            v_plot = v * float(plot_scales[i])
-            lbl = plot_labels[i]
+        t_pmt = np.asarray(t_axis["pmt_t"][:], dtype=np.float64) * 1e9
+        v_pmt = np.asarray(events["pmt_v"][last_idx, :], dtype=np.float64) * float(plot_scales[0])
+        t_feb = np.asarray(t_axis["feb_t"][:], dtype=np.float64) * 1e9
+        v_feb = np.asarray(events["feb_v"][last_idx, :], dtype=np.float64) * float(plot_scales[1])
 
-            plt.plot(t, v_plot, color=ch_color[ch], label=lbl)
+        plt.plot(t_pmt, v_pmt, color=color_cycle[0], label=plot_labels[0])
+        plt.plot(t_feb, v_feb, color=color_cycle[1], label=plot_labels[1])
 
         plt.title("Most recent waveform", loc="left")
         plt.xlabel("time (ns)", ha="right", x=1.0)
@@ -380,25 +372,13 @@ def make_live_plots(h5_path, channels, plot_scales, plot_labels):
         plt.clf()
 
         start_idx = max(0, n_events - 25)
-        labeled = {ch: False for ch in channels} # track what channels have been labeled
 
         for idx in range(start_idx, n_events):
-            for i, ch in enumerate(channels):
-                t = np.asarray(t_axis[f"{ch}_t"][:], dtype=np.float64) * 1e9
-                ds_name = "pmt_v" if i == 0 else "feb_v"
-                v = np.asarray(events[ds_name][idx, :], dtype=np.float64)
+            v_pmt = np.asarray(events["pmt_v"][idx, :], dtype=np.float64) * float(plot_scales[0])
+            v_feb = np.asarray(events["feb_v"][idx, :], dtype=np.float64) * float(plot_scales[1])
 
-                # apply per-channel scale
-                v_plot = v * float(plot_scales[i])
-
-                # label each channel first time it is drawn
-                if not labeled[ch]:
-                    lbl = plot_labels[i]
-                    labeled[ch] = True
-                else:
-                    lbl = None
-
-                plt.plot(t, v_plot, color=ch_color[ch], label=lbl, linewidth=1.0)
+            plt.plot(t_pmt, v_pmt, color=color_cycle[0], label=plot_labels[0] if idx == start_idx else None, linewidth=1.0)
+            plt.plot(t_feb, v_feb, color=color_cycle[1], label=plot_labels[1] if idx == start_idx else None, linewidth=1.0)
 
         plt.title("Last (up to) 25 events", loc="left")
         plt.xlabel("time (ns)", ha="right", x=1.0)
@@ -423,21 +403,13 @@ def make_live_plots(h5_path, channels, plot_scales, plot_labels):
 
         for j, idx in enumerate(range(first_idx, n_events)):
             evt_color = event_colors[j]  
-
-            # build a readable legend label for the event
             evt_label = f"event {idx + 1}"
 
-            # draw all channels for this event with the same color
-            for i, ch in enumerate(channels):
-                t = np.asarray(t_axis[f"{ch}_t"][:], dtype=np.float64) * 1e9
-                ds_name = "pmt_v" if i == 0 else "feb_v"
-                v = np.asarray(events[ds_name][idx, :], dtype=np.float64)
+            v_pmt = np.asarray(events["pmt_v"][idx, :], dtype=np.float64) * float(plot_scales[0])
+            v_feb = np.asarray(events["feb_v"][idx, :], dtype=np.float64) * float(plot_scales[1])
 
-                v_plot = v * float(plot_scales[i])
-
-                # label only once per event so legend shows up to 3 entries (one per event)
-                lbl = evt_label if i == 0 else None
-                plt.plot(t, v_plot, color=evt_color, label=lbl, linewidth=1.2)
+            plt.plot(t_pmt, v_pmt, color=evt_color, label=evt_label, linewidth=1.2)
+            plt.plot(t_feb, v_feb, color=evt_color, linewidth=1.2)
 
         plt.title("Last (up to) 3 events (all channels)", loc="left")
         plt.xlabel("time (ns)", ha="right", x=1.0)
@@ -599,7 +571,7 @@ def main():
             if int(scope.query('acquire:state?')) == 0:
                 if n_triggers == 0:
                     wfm_size = get_wfm_size(scope, channels[0])
-                    create_run_file(h5_path, channels, wfm_size,
+                    create_run_file(h5_path, wfm_size,
                                     feb_lane=feb_lane, pmt_id=pmt_id)
                     write_waveforms(scope, h5_path, channels, calibrations, True)
                     n_triggers += 1
@@ -616,7 +588,7 @@ def main():
 
             # make plots if desired
             if makeliveplots and n_triggers > 0:
-                make_live_plots(h5_path, channels, plot_scales, plot_labels)
+                make_live_plots(h5_path, plot_scales, plot_labels)
 
         except KeyboardInterrupt:
             caught_interrupt = True
